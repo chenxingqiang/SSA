@@ -505,20 +505,53 @@ def compute_auxiliary_loss(model, input_ids, attention_mask=None):
 
 
 def train_stage_2(model, tokenizer, args):
-    """Stage 2: Full fine-tune — unfreeze all weights, curriculum training."""
+    """Stage 2: Fine-tune with LoRA + router — curriculum training.
+
+    When --use_lora is set, the model is already wrapped with PEFT LoRA adapters.
+    Only LoRA weights and router params are trainable (~10-50M instead of 1.55B).
+    This reduces VRAM from ~30GB to ~12-15GB on the 32GB RTX 5090.
+
+    When --use_lora is NOT set, falls back to full fine-tune (requires ~30GB VRAM).
+    """
+    use_lora = args.use_lora
+    mode_label = "LoRA Fine-Tune" if use_lora else "Full Fine-Tune"
+
     print(f"\n{'='*60}")
-    print("Stage 2: Full Fine-Tune")
+    print(f"Stage 2: {mode_label}")
     print(f"{'='*60}")
 
     curriculum = CurriculumScheduler(stage=2)
-    curriculum.levels = [4096, 8192, 16384, 32768]
+    # Scaled curriculum for 1.5B model; O(n^2) _build_candidate_mask
+    # limits us from going beyond 8K with current router implementation.
+    curriculum.levels = [1024, 2048, 4096, 8192]
     curriculum.steps_per_level = args.max_steps // len(curriculum.levels)
 
-    total = unfreeze_all(model)
-    print(f"Trainable: {total:,} (all unfrozen)")
-    print(f"Curriculum: {curriculum.levels}")
+    if not use_lora:
+        total = unfreeze_all(model)
+        print(f"Trainable: {total:,} (all unfrozen)")
+    else:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+        # PEFT wraps the model; print its summary if available
+        if hasattr(model, 'print_trainable_parameters'):
+            model.print_trainable_parameters()
 
-    optimizer = AdamW(model.parameters(), lr=args.lr * 0.1)  # Lower LR for fine-tune
+    print(f"Curriculum: {curriculum.levels}")
+    print(f"Steps per level: {curriculum.steps_per_level}")
+
+    # Enable gradient checkpointing to save activation memory
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled")
+
+    # PEFT models may need input gradients enabled for gradient checkpointing
+    if use_lora and hasattr(model, 'enable_input_require_grads'):
+        model.enable_input_require_grads()
+
+    # Only optimize trainable params (PEFT already masks non-trainable)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=args.lr * 0.1)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.max_steps)
 
     device = args.device
@@ -554,7 +587,7 @@ def train_stage_2(model, tokenizer, args):
         loss.backward()
 
         if (step + 1) % args.grad_accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -565,12 +598,34 @@ def train_stage_2(model, tokenizer, args):
                 f"level={curriculum.get_level(step)} | loss={loss.item():.4f}"
             )
 
+        # Explicit memory cleanup after each step to prevent fragmentation
+        if use_lora and step % 10 == 0:
+            torch.cuda.empty_cache()
+
         if (step + 1) % args.save_interval == 0 and step > 0:
             path = os.path.join(args.output_dir, f"stage2_step{step+1}")
+            os.makedirs(path, exist_ok=True)
             model.save_pretrained(path)
+            # Save router params separately (PEFT save_pretrained may not include them)
+            router_state = {}
+            for name, param in model.named_parameters():
+                if 'ssa_router' in name:
+                    router_state[name] = param.data.clone()
+            if router_state:
+                torch.save(router_state, os.path.join(path, "router_params.pt"))
 
     path = os.path.join(args.output_dir, "stage2_final")
+    os.makedirs(path, exist_ok=True)
     model.save_pretrained(path)
+    # Save router params
+    router_state = {}
+    for name, param in model.named_parameters():
+        if 'ssa_router' in name:
+            router_state[name] = param.data.clone()
+    if router_state:
+        torch.save(router_state, os.path.join(path, "router_params.pt"))
+    if tokenizer is not None:
+        tokenizer.save_pretrained(path)
     print(f"Stage 2 complete. Model saved to {path}")
 
 
@@ -649,6 +704,19 @@ def parse_args():
     parser.add_argument("--ssa_top_k", type=int, default=2048)
     parser.add_argument("--ssa_num_codes", type=int, default=4096)
     parser.add_argument("--ssa_route_dim", type=int, default=32)
+    parser.add_argument("--load_from_stage1", type=str, default=None,
+                        help="Path to Stage 1 final checkpoint for loading router params")
+    parser.add_argument("--use_lora", action="store_true", default=False,
+                        help="Use LoRA for memory-efficient Stage 2 fine-tuning")
+    parser.add_argument("--lora_rank", type=int, default=32,
+                        help="LoRA rank (r)")
+    parser.add_argument("--lora_alpha", type=int, default=16,
+                        help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.1,
+                        help="LoRA dropout")
+    parser.add_argument("--lora_target_modules", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+                        help="Comma-separated target module names for LoRA")
     return parser.parse_args()
 
 
@@ -685,8 +753,54 @@ def main():
     )
     model = integrate_ssa_into_qwen(model, ssa_config, device=args.device)
 
+    # Load router parameters from Stage 1 checkpoint if specified
+    if args.load_from_stage1:
+        try:
+            from safetensors.torch import load_file
+            st_path = os.path.join(args.load_from_stage1, "model.safetensors")
+            if not os.path.exists(st_path):
+                st_path = os.path.join(args.load_from_stage1, "model-00001-of-00001.safetensors")
+            full_state = load_file(st_path)
+            router_state = {k: v for k, v in full_state.items() if "ssa_router" in k}
+            missing, unexpected = model.load_state_dict(router_state, strict=False)
+            print(f"Loaded {len(router_state)} router params from {args.load_from_stage1}")
+            if len(missing) > 0:
+                print(f"  Missing (Qwen base, expected): {len(missing)} keys")
+        except Exception as e:
+            print(f"WARNING: Could not load router state: {e}")
+
     # Patch attention forward
     replace_attention_forward(model)
+
+    # Apply LoRA for memory-efficient Stage 2/3 training
+    if args.use_lora:
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+        except ImportError:
+            print("ERROR: peft not installed. Run: pip install peft")
+            return
+
+        target_modules = [m.strip() for m in args.lora_target_modules.split(",")]
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(model, lora_config)
+
+        # PEFT freezes ALL parameters including our custom router params.
+        # Explicitly unfreeze router parameters so Stage 2 can train them.
+        router_requires = 0
+        for name, param in model.named_parameters():
+            if 'ssa_router' in name:
+                param.requires_grad = True
+                router_requires += param.numel()
+        print(f"LoRA applied: r={args.lora_rank}, "
+              f"targets={target_modules}")
+        print(f"  Router params unfrozen: {router_requires:,}")
 
     # Run training stage
     if args.stage == 1:
