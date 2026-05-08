@@ -238,20 +238,23 @@ class CodebookRouter(nn.Module):
         a = self.codes_per_query
         b = self.codes_per_key
 
-        # Query codes: [n_q, 1, h, a, 1] — expand for cross-product across positions
-        q_codes_exp = top_q_codes.view(n, 1, h, a, 1)  # [n_q, 1, h, a, 1]
+        mask = torch.zeros(n, h, n, dtype=torch.bool, device=device)
 
-        # Key codes: [1, n_k, h, 1, b] — expand for cross-product across positions
-        k_codes_exp = k_code_assign.view(1, n, h, 1, b)  # [1, n_k, h, 1, b]
+        # Process key positions in chunks to avoid O(n²·h·a·b) broadcast
+        # Original: code_match [n, n, h, a, b] = 134MB at n=1024
+        # Chunked: code_match [n, K_CHUNK, h, a, b] = ~17MB at K_CHUNK=128
+        K_CHUNK = min(128, n)
+        for kj_start in range(0, n, K_CHUNK):
+            kj_end = min(kj_start + K_CHUNK, n)
+            k_chunk = k_code_assign[kj_start:kj_end]  # [K_CHUNK, h, b]
 
-        # Compare: [n_q, n_k, h, a, b] — element-wise code equality
-        code_match = (q_codes_exp == k_codes_exp)  # [n_q, n_k, h, a, b]
+            # Broadcast: [n_q, 1, h, 1, a] x [1, K_CHUNK, h, b, 1]
+            q_exp = top_q_codes.view(n, 1, h, 1, a)        # [n, 1, h, 1, a]
+            k_exp = k_chunk.view(1, kj_end - kj_start, h, b, 1)  # [1, K_CHUNK, h, b, 1]
 
-        # Any code overlap between query i and key j? → [n_q, n_k, h]
-        any_match = code_match.any(dim=-1).any(dim=-1)  # [n_q, n_k, h]
-
-        # Transpose to canonical [n, h, n] format
-        mask = any_match.permute(0, 2, 1)  # [n_q, h, n_k]
+            match = (q_exp == k_exp)                      # [n, K_CHUNK, h, a, b]
+            any_match = match.any(dim=-1).any(dim=-1)     # [n, K_CHUNK, h]
+            mask[:, :, kj_start:kj_end] = any_match.permute(0, 2, 1)  # [n, h, K_CHUNK]
 
         return mask
 

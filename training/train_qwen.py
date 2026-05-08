@@ -599,7 +599,7 @@ def train_stage_2(model, tokenizer, args):
             )
 
         # Explicit memory cleanup after each step to prevent fragmentation
-        if use_lora and step % 10 == 0:
+        if use_lora and step % 10 == 0 and args.device == "cuda":
             torch.cuda.empty_cache()
 
         if (step + 1) % args.save_interval == 0 and step > 0:
@@ -736,9 +736,15 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    if args.device == "cuda":
+        model_dtype = torch.bfloat16
+    elif args.device == "mps":
+        model_dtype = torch.bfloat16  # MPS bf16 works on M1+; halves model VRAM
+    else:
+        model_dtype = torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
+        dtype=model_dtype,
         trust_remote_code=True,
     ).to(args.device)
 
